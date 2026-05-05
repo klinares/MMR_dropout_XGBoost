@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # 💉 MMR_dropout_XGBoost
 
 > *"First dose: ✅. Second dose: 📭. Machine learning: on it."*
@@ -21,7 +15,7 @@ with 10-fold cross-validation.
 
 ------------------------------------------------------------------------
 
-\## Background
+Background
 
 Afghanistan reported nearly 13,000 measles cases among children under
 five in 2024, with national two-dose vaccination coverage stalled at
@@ -34,7 +28,7 @@ conditions.
 
 ------------------------------------------------------------------------
 
-\## Data
+Data
 
 | Source | Description |
 |------------------------------------|------------------------------------|
@@ -55,8 +49,7 @@ education level, family wealth score, national immunization campaign
 participation, and five World Bank province-level indicators.
 
 ------------------------------------------------------------------------
-
-## Methods
+Methods
 
 All modeling uses the `tidymodels` framework in R with parallel
 processing via `future`.
@@ -79,7 +72,7 @@ minimizing false positives given resource constraints)
 
 ------------------------------------------------------------------------
 
-## Results
+Results
 
 The neural network achieved the best overall performance on the test
 set:
@@ -101,7 +94,7 @@ among the most important features driving predictions.
 
 ------------------------------------------------------------------------
 
-## Repository Structure
+Repository Structure
 
 ```         
 MMR_dropout_XGBoost/
@@ -132,10 +125,9 @@ MMR_dropout_XGBoost/
 ```
 
 ------------------------------------------------------------------------
+Reproducing the Analysis
 
-## Reproducing the Analysis
-
-### Prerequisites
+Prerequisites
 
 R 4.5 with the following packages:
 
@@ -150,7 +142,7 @@ pacman::p_load(
 )
 ```
 
-### Notes on reproducibility
+Notes on reproducibility
 
 Model tuning is computationally expensive. Pre-tuned model objects are
 saved as `.RDS` files in `outputs/` and loaded directly during rendering
@@ -161,7 +153,7 @@ processing via `plan(multisession)` is enabled).
 Update all `file_path` variables at the top of the `.qmd` to point to
 your local directory structure.
 
-### Render
+Render
 
 ``` bash
 quarto render mmr_dropout_ml_paper.qmd --to jasa-pdf
@@ -169,7 +161,7 @@ quarto render mmr_dropout_ml_paper.qmd --to jasa-pdf
 
 ------------------------------------------------------------------------
 
-## Limitations
+Limitations
 
 -   Small analytic sample (\~971 children) limits model generalizability
 -   Feature engineering required collapsing sparse factor levels, which
@@ -180,5 +172,3 @@ quarto render mmr_dropout_ml_paper.qmd --to jasa-pdf
     targeting guidance, not clinical prediction
 
 ------------------------------------------------------------------------
-
-## 
