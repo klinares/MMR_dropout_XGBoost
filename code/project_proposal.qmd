@@ -1,0 +1,129 @@
+---
+title: "MMR Dropout: A Predictive Approach"
+author: Kevin Linares
+embed-resources: true
+editor: visual
+execute:
+  warning: false
+  message: false
+  error: false
+  tidy: true
+format: pdf
+theme: spacelab
+---
+
+```{r, include=FALSE}
+
+knitr::opts_chunk$set(echo=FALSE,cache=FALSE, 
+                      message=FALSE, warning=FALSE)
+
+
+pacman::p_load(knitr, sjlabelled, haven, arrow, tidyverse )
+
+# var from child survey
+var_ch <- c("HH1", "HH2", "HH6", "HH7", "IM26", "IM26A", "CAGE", "chweight",
+            "IM12A", "IM12B", "IM12C", "IM12D", "melevel", "wscore")
+
+
+# variables from HH survey
+var_hh <- c( "HH1", "HH2", "HH52", "HC3", "HC4", "HC7G", 
+             "HC8", "HC14", "WS1", "WS9","WS11", "HW3" )
+
+# variables needed from mother survey
+var_wm <- c("HH1", "HH2", "WB4")
+
+# read in child survey first, join to household and mothers survey
+file_path <- 
+  "~/repos/UMD_classes_code/ML_social_science_SURV613/final/inputs/mics/Afghanistan/spss_dataset/"
+
+
+dat <- read_sav(str_c(file_path, "ch.SAV")) |> 
+  select(all_of(var_ch)) |> 
+  
+  # subset target group
+  filter(CAGE >= 24, # age
+         IM26 == 1) |> # measles vaccine, yes or no
+  
+  # join household variables
+  left_join(read_sav(str_c(file_path, "hh.SAV")) |> 
+             select(all_of(var_hh)), 
+           # join by cluster and HH id
+                     by = c( "HH1", "HH2") ) |> 
+  
+  # join mothers' variables
+  left_join(read_sav(str_c(file_path, "wm.SAV")) |> 
+             select(all_of(var_wm)), 
+           # join by cluster and HH id
+                     by = c( "HH1", "HH2") ) |> 
+  as_tibble() |> 
+  # convert variables to true doubles
+  mutate(HC3 = factor(HC3),
+         # convert labels to factors
+         across(where(is_labelled),~ haven::as_factor(.x)),
+         # capitalized only first letter in provicne name
+         HH7 = str_to_title(HH7)) 
+
+
+# read in province level data
+prov_dat <- read_csv("~/repos/UMD_classes_code/ML_social_science_SURV613/final/inputs/world_bank/Afghanistan_province_indicators.csv") |> 
+  tibble() |> 
+  mutate(province = factor(province))
+
+
+```
+
+```{r, include=FALSE}
+#Sample distribution whether a child has been vaccinated before dropping 
+# weighted outcome chweight
+dat |> 
+  count(IM26, wt=chweight) |> 
+  mutate(prop = n/sum(n))
+
+# Create outcome variable
+dat <- dat |> 
+  filter(IM26A != "DK") |> # 56 dont knows
+  mutate(outcome = ifelse(IM26A == "ONE", 0, 1)) |> 
+  # drop variables not needed
+  select(-HH1, -HH2, -chweight, -IM26, -IM26A)
+
+dat |> 
+  count(outcome) |> 
+  mutate(prop = n/sum(n))
+
+# features
+feature_selection <- dat |> get_label() |> as.data.frame() |> 
+  rownames_to_column()
+
+
+```
+
+Measles is a virus more contagious than Ebola or tuberculosis claiming thousands of lives yearly, and children under five are the most vulnerable. In 2024, the [WHO](https://www.emro.who.int/images/stories/afghanistan/Outbreak-Situation-Report-Week-14-2024.pdf) reported almost 13,000 measles cases for children under five in Afghanistan—a leading country in measles outbreak. The most effective prevention is full immunity from two inexpensive and readily available MMR vaccine doses completed by the time a child is 24 months. [UNICEF](https://www.unicef.org/stories/measles-cases-spiking-globally) reports that 2023 measles vaccine coverage in Afghanistan stalled at 83 percent which 95 percent coverage is needed to achieve population immunity. The challenge is that measles vaccines do not reach all children due to the displacement and ongoing conflict that has disrupted immunization campaigns, and many children that receive the first dose dropout from receiving the second, making them more vulnerable. We aim to build a model that can accurately predict vaccination dropout while highlighting the most important features to provide tailored intervention strategies that promote full vaccination against measles.
+
+We use 2023 survey data derived from UNICEF’s Multiple Indicator Cluster Survey ([MICS](https://mics.unicef.org/)) among Afghan children over 24 months having one or more doses. Vaccination dropout, coded as 1 (60% dropped out) or 0 (40% received), is our target variable resulting in a sample size of 2,224 across all 34 provinces. We select 22 features (see appendix) from the survey such as access to clean water and mother's education level. Additionally, we leverage [World Bank](https://www.worldbank.org/en/data/interactive/2019/08/01/afghanistan-interactive-province-level-visualization) province indicators (see appendix), such as literacy rate, food insecurity, poverty, and population density, that are related to the target variable.
+
+An XGBoost classification model will be constructed to predict the binary outcome of vaccination dropout, which is a robust method for missingness in features. We will also build a random forest and logistic regression model to stack against our XGBoost. Hyperparameter optimization will be conducted via a 10-fold cross-validation procedure, with an 80% training/testing partition stratified by country to maintain proportional representation. Model performance will be assessed using the AUC-ROC, which provides a measure of discriminatory power. The ROC allows us to evaluate the trade-off between sensitivity and 1 – specificity at various tuning parameters, while AUC will provide us with an evaluation of how well the model correctly classifies vaccination dropout. The model will be optimized to maximize precision by minimizing false positives to enhance its utility for informing stakeholders on intervention strategies promoting full vaccination.
+
+\newpage
+
+## Appendix
+
+Table 1 shows features from the MICS survey, a household survey program administered in several countries with the goal of developing metrics to monitor child and female health, education, and other factors related to human development. The MICS employs a multistage cluster sampling design to maximize (sub)national representation of households with children.
+
+Feature engineering entails one shot coding for several categorical features, scaling numeric predictors, and considering interactions when appropriate.
+
+```{r}
+feature_selection |> 
+  kable()
+```
+
+\newpage
+
+Table 2 presents features from the World Bank indicators on all 34 provinces in Afghanistan.
+
+```{r}
+prov_dat |> 
+  names() |> 
+  tibble() |> 
+  rename(indicators=1) |> 
+  kable()
+```

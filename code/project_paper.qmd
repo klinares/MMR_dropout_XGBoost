@@ -1,0 +1,766 @@
+---
+title: "MMR Dropout: A Predictive Approach"
+author: Kevin Linares
+embed-resources: true
+editor: visual
+execute:
+  warning: false
+  message: false
+  error: false
+  tidy: true
+format: pdf
+theme: spacelab
+---
+
+```{r, include=FALSE}
+
+knitr::opts_chunk$set(echo=FALSE, cache=FALSE, 
+                      message=FALSE, warning=FALSE)
+
+# packages needed
+pacman::p_load(knitr, sjlabelled, haven, ggmosaic, vip, kableExtra, sf, baguette, 
+               bonsai, brulee, stacks, future, tictoc, 
+               patchwork, viridis, ggthemes, janitor, tidymodels, tidyverse )
+
+plan(multisession)
+
+options(scipen = 999)
+
+# variables  from child survey
+var_ch <- c("HH1", "HH2", "HH6", "HH7", "IM26", "IM26A",
+            "CAGE", "chweight","IM12A", "IM12B", "IM12C",
+            "IM12D", "melevel", "wscore")
+
+
+# variables from household survey
+var_hh <- c( "HH1", "HH2", "HH52", "HC3", "HC4", "HC7G", 
+             "HC8", "HC14", "WS1", "WS9","WS11", "HW3" )
+
+
+# read in child survey first, join to household and mothers survey
+file_path <- 
+  "~/work/d/UMD_classes_code/ML_social_science_SURV613/final/inputs/mics/Afghanistan/spss_dataset/"
+
+
+
+survey_dat <-  read_sav(str_c(file_path, "ch.SAV")) |> 
+             select(all_of(var_ch)) |> 
+  
+  # subset target group
+  filter(CAGE >= 24, # age
+         IM26 == 1) |>   # measles vaccine, yes or no
+
+  # join household variables
+  left_join(read_sav(str_c(file_path, "hh.SAV")) |> 
+             select(all_of(var_hh)),
+           # join by cluster and HH id
+                     by = c( "HH1", "HH2")) |> 
+  
+  # convert variables to true doubles
+  mutate(HC3 = factor(HC3),
+         # convert labels to factors
+         across(where(is_labelled),~ as_character(.x)),
+         # capitalized only first letter in provicne name
+         HH7 = str_to_title(HH7)) |> 
+  rename(province=HH7) |> 
+  # remove variables
+  select(-CAGE) |> 
+  # clean variable names
+  janitor::clean_names() |> 
+  # replace DN as NA across
+  mutate(across(where(is.character), ~ na_if(.x, "DK"))) |> 
+  # drop rows with missing data
+  drop_na()
+
+
+
+# read in province level data
+prov_dat <- read_csv("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/inputs/world_bank/Afghanistan_province_indicators.csv") |> 
+  tibble() |> 
+  mutate(province = factor(province)) |> 
+  # clean variable names
+  janitor::clean_names()
+
+# join data
+survey_dat <- survey_dat |> left_join(prov_dat)
+
+
+# correct province names to merge with shape file
+position_names <- readRDS("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/shape_files/afghanistan_provincial_map.RDS") |> 
+  rename(prov = province) |> 
+  drop_na() |> 
+  # renamne provinces
+  mutate(prov = case_when(
+           prov == "Daikundi"~ "Daykundi",
+           prov == "Jawzjan"~ "Jowzjan",
+           prov == "Wardak"~ "Maidan Wardak",
+           prov == "Nimroz"~ "Nimruz",
+           prov == "Sar-e-pul"~ "Sar-e Pol",
+           prov == "Uruzgan"~ "Urozgan",
+         TRUE ~ prov))
+
+
+# read in shape file
+map_shape_file <- st_read("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/shape_files/afghan_province/afghan_province.shp") |> 
+  left_join(position_names)
+
+```
+
+```{r, include=FALSE}
+
+
+# Create outcome variable
+dat <- survey_dat |> 
+  mutate(outcome = ifelse(im26a == "ONE", "dropped", "completed"),
+         outcome = relevel(factor(outcome), ref="dropped")) |> 
+  # drop variables not needed
+  select(-hh1, -hh2, -chweight, -im26, -im26a) 
+
+# show outcome breakdown
+dat |> 
+  count(outcome) |> 
+  mutate(Percent = round(n/sum(n),2)*100 ) |> 
+  kable()
+
+# extract labels for feature selection
+feature_selection <- dat |> 
+  get_label() |> 
+  as.data.frame() |> 
+  rownames_to_column() |> 
+  rename(variable=1, label=2) |> 
+  mutate(label = ifelse(variable=="hc3", 
+                        "Number of Room in House", label)) 
+
+
+```
+
+```{r}
+# feature engineering
+dat <- dat |> 
+  mutate(
+    # combine campaing participation into 1 feature
+    im12a = ifelse(im12a =="YES", 1, 0),
+    im12b = ifelse(im12b =="YES", 1, 0),
+    im12c = ifelse(im12c =="YES", 1, 0),
+    im12d = ifelse(im12d =="YES", 1, 0),
+    campaign = im12a + im12b + im12c + im12d,
+    # collapse campgin into responses
+    campaign = case_when(
+      # there are only 14 0s
+      between(campaign, 0, 1) ~ "some",
+      campaign == 2 ~ "half",
+      campaign ==3 ~ "half",
+      campaign == 4 ~ "all"),
+    campaign = fct_relevel(campaign, c("all","half", "some")), 
+    # shorten response categories by collapsing secondary
+    ## less than 14 % were secondary or higher, 7% primary
+    melevel = case_when(
+      melevel == "Pre-primary/ECE or none" ~ "Primary/None",
+      melevel == "Primary" ~ "Primary/None",
+      melevel == "Lower Secondary" ~ "secondary/higher",
+      melevel == "Upper Secondary" ~ "secondary/higher",
+      melevel == "Higher" ~ "secondary/higher"),
+    # main source of drinking water has lots of categories, collapse
+    ws1 = case_when(
+      str_detect(ws1, "PIPED") ~ "city",
+      str_detect(ws1, "WELL") ~ "well",
+      TRUE ~ "other"),
+    # hc4, type of household floor material has 7 categories, collapse
+    hc4 = case_when(
+      str_detect(hc4, "EARTH") ~ "dirt",
+      str_detect(hc4, "CARPET") ~ "carpet",
+      TRUE ~ "other"),
+    # collapse yes no responses to having electricity
+    hc8 = case_when(
+      str_detect(hc8, "NO") ~ "no electricity",
+      str_detect(hc8, "GRID") ~ "grid",
+      str_detect(hc8, "GENERATOR") ~ "generator"),
+    # type of toilet has 12 categories, collapse 
+    ws11 = case_when(
+      str_detect(ws11, "SEWER") ~ "sewer",
+      str_detect(ws11, "SEPTIC") ~ "septic",
+      str_detect(ws11, "PIT") ~ "pit",
+      str_detect(ws11, "BUSH") ~ "outhouse",
+      str_detect(ws11, "LATRINE") ~ "latrine",
+      TRUE ~ "other"),
+    # collapse yes no responses for having hand soap in bathroom
+    hw3 = case_when(
+      str_detect(hw3, "NO") ~ "no",
+      str_detect(hw3, "YES") ~ "yes"),
+    across(where(is.character), ~ str_to_lower(.x)),
+    ) 
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+#| 
+# create plots
+
+dat |> 
+  ggplot() +
+   geom_mosaic(aes(x=product(outcome), fill=outcome,
+                  conds = product(campaign))) +
+  facet_grid(cols=vars(hh6), rows=vars(melevel)) +
+  scale_fill_viridis_d(option="rocket", begin =.50, end = .85, 
+                       alpha=.85, direction=1) +
+  coord_flip() +
+  guides(color=guide_legend( reverse = TRUE)) +
+  theme_mosaic() |> 
+  labs(x = "Campaign Participation",
+    title=
+  "Figure 1. Risk for dropping decreases with national immunization campaign 
+  exposure, varies by mothers' education level and rural/urban divide.")
+
+```
+
+```{r}
+
+
+# fix province names to match wtih shape files
+dat  <- dat |> 
+  rename(prov = province) |> 
+  mutate(prov = str_to_title(prov),
+         prov = case_when(
+           prov == "Jawzjan"~ "Jowzjan",
+           prov == "Kunarha" ~ "Kunar",
+           prov == "Nimroz"~ "Nimruz",
+           prov == "Nooristan" ~ "Nuristan",
+           prov == "Paktya" ~ "Paktia",
+           prov == "Panjsher" ~ "Panjshir",
+           prov == "Sar-E-Pul" ~ "Sar-e Pol",
+         TRUE ~ prov)
+  )
+
+
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 11
+#| 
+# combine outcome by region
+dat_province <- dat |> 
+  select(prov, conflict_index:outcome) |> 
+  mutate(outcome = ifelse(outcome == "dropped", 1, 0)) |> 
+  group_by(prov) |> 
+  reframe(outcome = mean(outcome),
+         health_institutional_delivery = mean(health_institutional_delivery),
+         female_literacy_rate = mean(female_literacy_rate))
+
+
+map_shape_file <- map_shape_file |> 
+  left_join(dat_province) 
+
+p1 <- ggplot(map_shape_file) +
+  geom_sf(aes(fill = outcome)) +
+  geom_text(aes(position_x, position_y, label = prov),  size = 3, color="white") +
+  theme(plot.title = element_text(hjust = 0.5, size = 16)) +
+  theme_map() +
+  scale_fill_viridis(option="mako", direction = -1) + 
+  labs(title = "Figure 2. Proportion of Measles Vaccine Dropout in Afghanistan",
+       fill = NULL)
+
+
+p2 <- ggplot(map_shape_file) +
+  geom_sf(aes(fill = health_institutional_delivery), show.legend = FALSE) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16)) +
+  theme_map() +
+  scale_fill_viridis(option="mako", direction = -1) + 
+  labs(title = "Health Institution Availability",
+       fill = NULL)
+
+
+p3 <- ggplot(map_shape_file) +
+  geom_sf(aes(fill = female_literacy_rate), show.legend = FALSE) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16)) +
+  theme_map() +
+  scale_fill_viridis(option="mako", direction = -1) + 
+  labs(title = "Female Literacy Rate",
+       fill = NULL)
+
+p1 / (p2 | p3)  
+
+
+```
+
+```{r}
+# modeling 
+set.seed(909)
+
+mod_dat <- dat |> 
+  mutate(outcome = relevel(outcome, ref = "completed")) |> 
+  select(-prov, -campaign)
+
+
+
+dat_split <- initial_split(mod_dat,  prop = .80, breaks = 2)
+dat_train <- training(dat_split) # train split
+dat_test <- testing(dat_split) # test split
+
+# print outcome proportions from split
+dat_train |> select(outcome) |> mutate(splits = "train") |> 
+  add_row(dat_test |> select(outcome) |> mutate(splits = "test")) |> 
+  group_by(splits) |> 
+  count(outcome) |> 
+  mutate(prop = n/sum(n)) |> 
+  kable()
+
+# CV 10 fold
+cv_split <- vfold_cv(dat_train, v=10)
+
+# define preprocessing steps
+rec <-  recipe(outcome~., data=mod_dat) |> 
+  # create binary terms for categories
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)  |>  
+  # scale and center continuous predictors
+  step_normalize(all_double_predictors()) #|>    
+  # balance outcome come levels for dropped
+  #themis::step_smote(outcome, neighbors = 5)
+
+# set performance metrics
+eval_metrics <- metric_set(roc_auc, f_meas)
+
+# for confusion matrix
+update_geom_defaults(geom = "rect", new = list(fill = "dodgerblue", alpha = 0.7))
+
+
+
+# ______________________________ Helpful functions for modeling ________________________________
+
+
+
+# tune model 
+tune_model_fun <- function(work_flow, tuning_grid){
+  work_flow |> 
+   tune_grid(
+     resamples = cv_split, 
+     grid = tuning_grid, 
+     control = control_grid(allow_par = TRUE,
+                            parallel_over = "resamples", 
+                            save_pred = TRUE),
+     metrics = eval_metrics)
+}
+
+
+# create final model fit to the test set, generate predictions
+finalize_mod_fun <- function(mod_wf, mod_optimal){
+  
+  # finalize the model on the test set
+  mod_final = finalize_workflow(mod_wf, mod_optimal) |> 
+    last_fit(dat_split)
+
+  # get predictions from final model
+  predictions <- mod_final |> 
+    collect_predictions()
+  
+  return(predictions)
+}
+
+
+# extract model performance
+mod_performance_fun <- function(mod_predictions, mod_name){
+    
+  # pull metrics out
+  tibble(
+    f1_score = mod_predictions |> f_meas(truth=outcome, estimate = .pred_class) |> 
+      pull(),
+    roc_auc = mod_predictions |> roc_auc(truth=outcome, 
+                                         .pred_dropped, event_level="second") |> 
+      pull(), 
+    model = mod_name)
+  
+}
+
+
+# generate confusionmatrix plot
+conf_matrix_fun <- function(mod_predictions){
+    
+  mod_predictions |> 
+    mutate(.pred_class = relevel(.pred_class, "dropped"),
+           outcome = relevel(outcome, "dropped")) |> 
+    conf_mat(truth = outcome, estimate=.pred_class) |> autoplot()
+}
+
+```
+
+```{r}
+#______ Preprocess modeling steps _________
+# _____ logistic regression ______________
+
+# step 1, build the model w/ penalized parameter
+lr_mod <- 
+  logistic_reg(penalty = tune(), # let tune be set automatically to tune later
+               mixture = tune()) |> # 1 means remove irrelevant predictors (lasso)
+  set_mode("classification")  |> # for binary outcomes
+  set_engine("glmnet") # the algorithm
+
+# step 2, create work flow
+lr_wf <- workflow() |> 
+  add_model(lr_mod) |> 
+  add_recipe(rec) 
+
+
+#_____________ create tuning grid, and train & tune model  ______________
+
+# we set how many candidates of the penalty parameter to evaluate on
+
+lr_tune_grid <- extract_parameter_set_dials(lr_mod) |>
+ grid_space_filling(penalty(), mixture(), size=100) |>
+  filter(penalty < .2)
+
+tic()
+lr_res <- tune_model_fun(lr_wf, lr_tune_grid)
+toc()
+
+#save model output
+saveRDS(lr_res, "~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/lr_res.RDS")
+
+# read in models
+#lr_res <- readRDS("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/lr_res.RDS")
+
+#__________________ finalize model ______________________
+# select best model
+
+# plot performance metrics for tuning parameter
+lr_res |> 
+  collect_metrics() |> 
+  ggplot(aes(x=penalty, y=mean, color=.metric)) + 
+  geom_line() +
+  geom_point() +
+  scale_color_viridis_d(option = "plasma", end = .75) +
+  theme_hc()
+
+# select best
+lr_optimal <- lr_res |> 
+    select_best(metric="f_meas") 
+
+lr_predictions <- finalize_mod_fun(lr_wf, lr_optimal)
+
+lr_performance <- mod_performance_fun(lr_predictions, mod_name = "lr")
+
+conf_matrix_fun(lr_predictions)
+
+
+```
+
+```{r}
+
+#______ Preprocess modeling steps _________
+# _____ Neural Network ______________
+
+# step 1, build the model w/ penalized parameter
+nnet_mod <- 
+  mlp(epochs = tune(), 
+      hidden_units = tune(), 
+      penalty = tune()
+      ) |>  
+  set_mode("classification")  |> # for binary outcomes
+  set_engine("nnet") # the algorithm
+
+# step 2, create work flow
+nnet_wf <- workflow() |> 
+  add_model(nnet_mod) |> 
+  add_recipe(rec) 
+
+
+#_____________ create tuning grid, and train & tune model  ______________
+
+# we set how many candidates of the tuning parameter to evaluate on
+nnet_tune_grid <- grid_space_filling(penalty(), epochs(), hidden_units(), size=300)
+
+ tic()
+ nnet_res <- tune_model_fun(nnet_wf, nnet_tune_grid)
+ toc()
+
+saveRDS(nnet_res, "~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/nnet_res.RDS")
+
+# read in models
+# nnet_res <- readRDS("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/nnet_res.RDS")
+
+
+nnet_res |> 
+  collect_metrics() |> 
+  filter(.metric == "f_meas") |> 
+  select(hidden_units:epochs, mean) |> 
+  rename(F1_score=mean) |> 
+  #mutate(epochs=factor(epochs)) |> 
+  ggplot(aes(x=epochs, y=F1_score, color=penalty)) +
+  geom_point( alpha = 0.8, show.legend = TRUE) +
+  facet_grid(~hidden_units) +
+   scale_x_discrete(guide = guide_axis(n.dodge=3)) +
+  scale_color_viridis(option = "plasma", end = .75) +
+  theme_hc() 
+
+#__________________ finalize model ______________________
+# select best model
+
+# run functions
+nnet_optimal <- nnet_res |> select_best(metric="f_meas") 
+
+nnet_predictions <- finalize_mod_fun(nnet_wf, nnet_optimal)
+
+nnet_performance <- mod_performance_fun(nnet_predictions, mod_name = "nnet")
+
+conf_matrix_fun(nnet_predictions)
+
+
+```
+
+```{r}
+#______ Preprocess modeling steps _________
+# _____ BAGGING ______________
+
+# workflow
+
+# step 1, build the model w/ penalized parameter
+bag_mod <-   bag_tree(tree_depth = tune(), 
+                      cost_complexity = tune(),
+                      min_n =tune() ) |> 
+  set_engine("rpart", times = 25) |>
+  set_mode("classification")
+
+
+
+# step 2, create work flow
+bag_wf <- workflow() |> 
+  add_model(bag_mod) |> 
+  add_recipe(rec) 
+
+
+#_____________ create tuning grid, and train & tune model  ______________
+
+bag_tune_grid <- expand_grid(
+ cost_complexity = seq(.0001,.01, .005),
+min_n = c(8, 10, 12),
+tree_depth = seq(2, 6)
+)
+
+#tune model
+ tic()
+ bag_res <- tune_model_fun(bag_wf, bag_tune_grid)
+ toc()
+ 
+# save model output
+saveRDS(bag_res, "~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/bag_res.RDS")
+
+# read in models
+# bag_res <- readRDS("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/bag_res.RDS")
+
+
+#__________________ finalize model ______________________
+# select best model
+
+
+# plot performance metrics for tuning parameter
+bag_res |> 
+  collect_metrics() |> 
+  ggplot(aes(x=cost_complexity, y=mean, color=as.character(tree_depth))) + 
+  geom_line() +
+  geom_point() +
+  facet_grid(rows=vars(.metric), cols=vars(min_n)) +
+  scale_color_viridis_d(option = "plasma", end = .75) +
+  theme_hc()
+
+
+bag_optimal <- bag_res |> select_best(metric="f_meas") 
+
+  
+# finalize the model on the test set
+bag_final <- finalize_workflow(bag_wf, bag_optimal) |> 
+  last_fit(dat_split)
+
+# fun functions
+bag_predictions <- finalize_mod_fun(bag_wf, bag_optimal)
+
+bag_performance <- mod_performance_fun(bag_predictions, mod_name = "bagging")
+
+conf_matrix_fun(bag_predictions)
+```
+
+```{r}
+
+#______ Preprocess modeling steps _________
+# _____ RANOM FOREST ______________
+
+# workflow
+
+# step 1, build the model w/ penalized parameter
+rf_mod <- rand_forest(mtry = tune(),  trees = tune(), min_n = tune()) |>
+  set_engine("ranger") |>
+  set_mode("classification")
+
+# step 2, create work flow
+rf_wf <- workflow() |> 
+  add_model(rf_mod) |> 
+  add_recipe(rec) 
+
+
+#_____________ create tuning grid, and train & tune model  ______________
+
+#we set how many candidates of the penalty parameter to evaluate on
+rf_tune_grid <- expand_grid(
+ mtry = seq(4, 5),
+ min_n = seq(8, 12),
+ trees = seq(500, 2000, 500)
+)
+
+tic()
+rf_res <- tune_model_fun(rf_wf, rf_tune_grid)
+toc()
+
+# save model output
+saveRDS(rf_res, "~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/rf_res.RDS")
+
+# read in models
+# rf_res <- readRDS("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/rf_res.RDS")
+
+#__________________ finalize model ______________________
+# select best model
+
+# plot performance metrics for tuning parameter
+rf_res |> 
+  collect_metrics() |> 
+  ggplot(aes(x=trees, y=mean, color=as.character(mtry))) + 
+  geom_line() +
+  geom_point() +
+  facet_grid(rows=vars(.metric), cols=vars(min_n)) +
+  scale_color_viridis_d(option = "plasma", end = .75) +
+  theme_hc()
+
+
+
+# run functions
+rf_optimal <- rf_res |> select_best(metric="f_meas") 
+
+rf_predictions <- finalize_mod_fun(rf_wf, rf_optimal)
+
+rf_performance <- mod_performance_fun(rf_predictions, mod_name = "rf")
+
+conf_matrix_fun(rf_predictions)
+
+```
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+
+#______ Preprocess modeling steps _________
+# _____ XGBOOST  ______________
+
+# workflow
+
+
+# step 1, build the model w/ penalized parameter
+xgb_mod <-
+  boost_tree(# create tuning grid
+    tree_depth = tune(), # number of splits
+    mtry = tune(),
+    learn_rate = tune(), # shrinkage
+    loss_reduction = tune(), # reduction in the loss function required to split
+    trees = tune(), # trees contained in ensemble
+    sample_size = tune(),
+    min_n = tune()) |> # classification for binary data
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+# step 2, create work flow
+xgb_wf <- workflow() |> 
+  add_model(xgb_mod) |> 
+  add_recipe(rec) 
+
+#_____________ create tuning grid, and train & tune model  ______________
+
+
+# create tuning grid
+boost_tune_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  trees(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), dat_train),
+  learn_rate(),
+  size = 500
+) |>
+  filter(
+    tree_depth < 10,
+    mtry < 10,
+    min_n > 8,
+    learn_rate < .02,
+    loss_reduction < .01,
+  )
+
+tic()
+xgb_res <- tune_model_fun(xgb_wf, boost_tune_grid)
+toc()
+
+
+# save model output
+saveRDS(xgb_res, "~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/xgb_res.RDS")
+
+# read in models
+#xgb_res <- readRDS("~/work/d/UMD_classes_code/ML_social_science_SURV613/final/outputs/xgb_res.RDS")
+
+
+xgb_res |> 
+  collect_metrics() |> 
+  filter(.metric == "f_meas") |> 
+  select(mtry:sample_size, mean) |> 
+  pivot_longer(-c( "mean"), 
+               values_to = "value",
+               names_to = "parameter") |> 
+  rename(Score=mean) |> 
+  ggplot(aes(x=value, y=Score, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  scale_color_viridis_d(option = "plasma", end = .75) +
+  theme_hc()
+#__________________ finalize model ______________________
+
+# run functions
+xgb_optimal <- xgb_res |> select_best(metric="f_meas") 
+
+xgb_predictions <- finalize_mod_fun(xgb_wf, xgb_optimal)
+
+xgb_performance <- mod_performance_fun(xgb_predictions, mod_name = "xgb")
+
+conf_matrix_fun(xgb_predictions)
+
+```
+
+```{r}
+
+# predict on validation set
+# combine predictions
+p1 <- lr_predictions |> 
+  mutate(model="lr") |> 
+  add_row(nnet_predictions |> mutate(model="nnet") ) |> 
+  add_row(bag_predictions |> mutate(model="bagging") ) |> 
+  add_row(rf_predictions |> mutate(model="rf") ) |> 
+  add_row(xgb_predictions |> mutate(model="xgb") ) |> 
+  mutate(model =fct_reorder(model, .pred_dropped, mean)) |> 
+  group_by(model) |> 
+  roc_curve(truth=outcome, .pred_dropped, event_level = "second") |> 
+  # plot both
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8, show.legend = FALSE) +
+  coord_equal() + 
+  scale_color_viridis_d(option = "magma", end = .9, alpha=.8) +
+  theme_hc() +
+  labs(title="Figure 4. Final Model Selection Predicting 
+       Target Variable in Test Set.")
+
+p2 <- # combine test error estimates
+lr_performance |> 
+  full_join(nnet_performance) |> 
+  full_join(bag_performance) |> 
+  full_join(rf_performance) |> 
+  full_join(xgb_performance) |> 
+  pivot_longer(-model, names_to="Performance_Metric", values_to = "Score") |> 
+  mutate(model =fct_reorder(model, Score, mean)) |> 
+  ggplot(aes(x=Performance_Metric, y=Score, fill=model)) +
+  geom_col(position = "dodge") +
+  theme_hc() +
+  scale_fill_viridis_d(option="magma", end=.9, alpha=.8)
+
+(p1 + p2) +  plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+```
