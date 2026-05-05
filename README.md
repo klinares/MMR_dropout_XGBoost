@@ -13,6 +13,8 @@ with 10-fold cross-validation.
 
 **Author:** Kevin Linares · University of Maryland, JPSM
 
+Paper -> [MMR Dropout: A Predictive Approach](https://klinares.github.io/MMR_dropout_XGBoost/paper/mmr_dropout_ml_paper.html)
+
 ------------------------------------------------------------------------
 
 Background
